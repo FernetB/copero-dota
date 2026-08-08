@@ -12,7 +12,7 @@ import { luckTraitFor } from "../src/game/luck";
 import { randomSeed } from "../src/game/rng";
 import { simulateTournament } from "../src/game/sim";
 import { computeStrength, swapHeroAssignment } from "../src/game/strength";
-import type { DataBundle, Pack, SimTeam, TeamStrength } from "../src/game/types";
+import type { DataBundle, Pack, SimResult, SimTeam, TeamStrength } from "../src/game/types";
 import { autopick } from "../src/mp/autopick";
 import {
   applyAction,
@@ -64,6 +64,8 @@ interface RoomState {
   field: SimTeam[] | null;
   simSeed: number | null;
   beat: { idx: number; playing: boolean } | null;
+  /** Victory phrases by playerId — server-side secret until a taunt beat fires. */
+  phrases: Record<string, string[]>;
 }
 
 const freshRoom = (): RoomState => ({
@@ -78,6 +80,7 @@ const freshRoom = (): RoomState => ({
   field: null,
   simSeed: null,
   beat: null,
+  phrases: {},
 });
 
 const CLEANUP_MS = 60 * 60 * 1000;
@@ -91,6 +94,7 @@ export class CoperoRoom extends Server<Env> {
   private bundle: DataBundle | null = null;
   private pool: Pack[] | null = null;
   private beats: Beat[] | null = null;
+  private simResult: SimResult | null = null;
 
   async onStart() {
     const stored = await this.ctx.storage.get<RoomState>("room");
@@ -128,6 +132,7 @@ export class CoperoRoom extends Server<Env> {
       field: r.field,
       simSeed: r.simSeed,
       beat: r.beat,
+      taunt: this.currentTaunt(),
     };
   }
 
@@ -157,10 +162,30 @@ export class CoperoRoom extends Server<Env> {
 
   private ensureBeats(): Beat[] {
     if (!this.beats) {
-      const result = simulateTournament(this.room.field!, this.room.simSeed!);
-      this.beats = buildBeats(result);
+      this.simResult = simulateTournament(this.room.field!, this.room.simSeed!);
+      this.beats = buildBeats(this.simResult);
     }
     return this.beats;
+  }
+
+  /**
+   * The victory phrase for the current beat, if it is a taunt beat for a
+   * human-vs-human series whose winner wrote phrases. This is the only place
+   * a phrase ever leaves the server — and only one, at its moment.
+   */
+  private currentTaunt(): { ownerId: string; phrase: string } | null {
+    const r = this.room;
+    if (r.phase !== "broadcasting" || !r.beat || r.field == null || r.simSeed == null) return null;
+    const beats = this.ensureBeats();
+    const b = beats[Math.min(r.beat.idx, beats.length - 1)];
+    if (b.kind !== "taunt") return null;
+    const m = this.simResult?.rounds[b.roundIdx]?.matches[b.matchIdx];
+    const ownerId = m?.winner.ownerId;
+    if (!m || ownerId == null || m.loser.ownerId == null) return null;
+    const phrases = r.phrases[ownerId];
+    if (!phrases?.length) return null;
+    const pick = ((r.simSeed >>> 0) + b.roundIdx * 1009 + b.matchIdx * 101) % phrases.length;
+    return { ownerId, phrase: phrases[pick] };
   }
 
   // ---- connections ----
@@ -304,7 +329,8 @@ export class CoperoRoom extends Server<Env> {
       }
       case "phrases": {
         const phrases = sanitizeWinPhrases(msg.phrases);
-        this.room.seats[seat].winPhrases = phrases.length ? phrases : undefined;
+        if (phrases.length) this.room.phrases[playerId!] = phrases;
+        else delete this.room.phrases[playerId!];
         break;
       }
       case "start": {
@@ -535,6 +561,7 @@ function migrateRoom(stored: RoomState): RoomState {
   }
   stored.config = sanitizeConfig(stored.config);
   stored.heroAssignments ??= null;
+  stored.phrases ??= {};
   return stored;
 }
 
